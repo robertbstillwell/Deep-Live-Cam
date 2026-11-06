@@ -389,7 +389,7 @@ dist_black = ndimage.distance_transform_edt(m_black0)
 _nb = cls_w == 0
 _, (_iy, _ix) = ndimage.distance_transform_edt(_nb, return_indices=True)
 nearest_nonblack = cls_w[_iy, _ix]            # class of the nearest non-black pixel
-Image.fromarray((wide_black * 120 + thin_black * 255).astype(np.uint8)).save(f'{OUT}/debug_black_split.png' if DEBUG else '/dev/null')
+if DEBUG: Image.fromarray((wide_black * 120 + thin_black * 255).astype(np.uint8)).save(f'{OUT}/debug_black_split.png')
 
 def satin_coverage(runs, shape):
     cov = np.zeros(shape, np.uint8)
@@ -426,7 +426,7 @@ for li, (name, hexcol, c, ang, sp, sl, dl, under) in enumerate(layers):
         n_before = len(pattern.stitches)
         first = add_runs(pattern, directional_fill(rem, ang, sp, 2.0), first)
         print(f"{'  remainder fill':40s} {len(pattern.stitches) - n_before:6d} stitches")
-        Image.fromarray((rem * 255).astype(np.uint8)).save(f'{OUT}/debug_black_remainder.png' if DEBUG else '/dev/null')
+        if DEBUG: Image.fromarray((rem * 255).astype(np.uint8)).save(f'{OUT}/debug_black_remainder.png')
     elif c == 1:
         first = add_runs(pattern, directional_fill(m, ang, sp, sl), first)
     else:
