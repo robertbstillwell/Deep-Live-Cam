@@ -183,6 +183,97 @@ def fill_layer(mask, angle, spacing_mm, stitch_mm, min_seg_mm=0.25):
         runs.append(Q)
     return runs
 
+
+# ---------------------------------------------------------------- satin border
+from scipy.spatial import cKDTree
+
+BORDER_W_MM = 3.0      # finished satin width, centred on the patch edge
+
+def resample(poly, step):
+    """Resample a closed polyline (N,2) to roughly uniform spacing `step`."""
+    poly = np.vstack([poly, poly[:1]])
+    seg = np.linalg.norm(np.diff(poly, axis=0), axis=1)
+    L = np.concatenate(([0], np.cumsum(seg)))
+    t = np.arange(0, L[-1], step)
+    return np.column_stack([np.interp(t, L, poly[:, 0]), np.interp(t, L, poly[:, 1])])
+
+def smooth_closed(poly, win):
+    k = np.ones(win) / win
+    out = np.empty_like(poly)
+    for d in range(2):
+        out[:, d] = np.convolve(np.concatenate([poly[-win:, d], poly[:, d], poly[:win, d]]), k, 'same')[win:-win]
+    return out
+
+def contours_of(mask):
+    cnts, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    return [c[:, 0, :].astype(np.float64) for c in cnts if len(c) > 20]
+
+def offset_points(mask, mm):
+    k = int(round(abs(mm) * U)) * 2 + 1
+    el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    m2 = cv2.dilate(mask.astype(np.uint8), el) if mm > 0 else cv2.erode(mask.astype(np.uint8), el)
+    pts = [resample(c, 0.5) for c in contours_of(m2)]
+    return np.vstack(pts) if pts else None
+
+def border_centreline(mask):
+    """Smoothed outer contour of the patch (corners rounded ~1.5 mm), every 0.05 mm."""
+    soft = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), 0.6 * U) > 0.5
+    c = max(contours_of(soft), key=len)
+    c = resample(c, 1.0)
+    for _ in range(3):
+        c = smooth_closed(c, 25)          # 3 passes of a 2.5 mm box filter
+    return resample(c, 0.5), soft
+
+def zigzag(centre, soft_mask, half_w_mm, density_mm):
+    """Satin / zigzag of total width 2*half_w centred on the path.
+
+    Needle points are offset along smoothed normals; the step along the path is
+    chosen so that the longer side (outside of a bend) keeps the requested density."""
+    half_w = half_w_mm * U
+    n = len(centre); k = 10                              # 0.5 mm tangent stencil
+    tang = centre[(np.arange(n) + k) % n] - centre[(np.arange(n) - k) % n]
+    tang /= np.linalg.norm(tang, axis=1)[:, None] + 1e-9
+    nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
+    probe = centre[0] + nrm[0] * half_w
+    px, py = int(round(probe[0])), int(round(probe[1]))
+    inside = 0 <= px < soft_mask.shape[1] and 0 <= py < soft_mask.shape[0] and soft_mask[py, px]
+    if inside: nrm = -nrm                                 # make normals point outward
+    outer = centre + nrm * half_w
+    inner = centre - nrm * half_w
+    step = density_mm * U / 2.0
+    pts, side, acc_o, acc_i = [], 0, 0.0, 0.0
+    for i in range(n):
+        if i:
+            acc_o += np.hypot(*(outer[i] - outer[i - 1])); acc_i += np.hypot(*(inner[i] - inner[i - 1]))
+        if not pts or max(acc_o, acc_i) >= step:
+            pts.append(outer[i] if side == 0 else inner[i]); side ^= 1; acc_o = acc_i = 0.0
+    pts.append(pts[0]); pts.append(pts[1])                # close the ring with a small overlap
+    return np.array(pts)
+
+def run_stitch(centre, stitch_mm):
+    pts = resample(centre, stitch_mm * U)
+    return np.vstack([pts, pts[:2]])
+
+centre, soft_mask = border_centreline(m_w)
+tack_run   = run_stitch(centre, 2.5)
+zz_under   = zigzag(centre, soft_mask, BORDER_W_MM / 2 - 0.35, 2.0)
+satin_top  = zigzag(centre, soft_mask, BORDER_W_MM / 2, 0.38)
+
+# make the fills meet the border: fill any sliver between the original edge and the
+# (rounded) border centreline with the base grey, and clip everything to the satin's
+# outer edge less 0.3 mm so nothing pokes out at rounded corners
+def poly_mask(poly):
+    m = np.zeros(m_w.shape, np.uint8)
+    cv2.fillPoly(m, [np.round(poly).astype(np.int32)], 1)
+    return m > 0
+inside_centre = poly_mask(centre)
+outer_half = zigzag(centre, soft_mask, BORDER_W_MM / 2 - 0.3, 0.2)[0::2]   # outer needle points only
+inside_outer = poly_mask(outer_half)
+gap = inside_centre & ~m_w
+cls_w[gap] = 2
+cls_w[~inside_outer] = 255
+m_w = (cls_w != 255)
+
 # ---------------------------------------------------------------- assemble
 def dil(m, mm):
     k = int(round(mm * U)) * 2 + 1
@@ -200,6 +291,7 @@ layers = [
 ]
 
 pattern = pe.EmbPattern()
+BLACK = 0x000000
 TRAVEL_MAX = 2.0 * U      # straight travel stitches instead of trim below this gap
 
 def add_tie(pat, x, y, dx=0.6 * U):
@@ -230,11 +322,27 @@ def add_runs(pat, runs, first_in_layer):
             pat.add_stitch_absolute(pe.STITCH, x, y)
     return first_in_layer
 
+def block(name, hexcol, runs_list, first_block=False):
+    """One colour block (machine stop) made of stitch runs."""
+    if not first_block: pattern.add_command(pe.COLOR_CHANGE)
+    pattern.add_thread({"color": hexcol, "description": "Black", "brand": "Generic"})
+    before = len(pattern.stitches)
+    first = True
+    for runs in runs_list:
+        first = add_runs(pattern, runs, first)
+    lx, ly = pattern.stitches[-1][:2]; add_tie(pattern, lx, ly)
+    pattern.add_command(pe.TRIM)
+    print(f"{name:40s} {len(pattern.stitches) - before:6d} stitches")
+
+# Block 1: placement + tack-down line (sew once on stabilizer, lay twill, sew again)
+block("Black - placement line (lay twill after)", BLACK, [[tack_run]], first_block=True)
+block("Black - tack-down line", BLACK, [[tack_run]])
+
 total = 0
 for li, (name, hexcol, c, ang, sp, sl, dl, under) in enumerate(layers):
     m = cls_w == c
     if dl > 0: m = dil(m, dl) & m_w
-    if li > 0: pattern.add_command(pe.COLOR_CHANGE)
+    pattern.add_command(pe.COLOR_CHANGE)
     pattern.add_thread({"color": hexcol, "description": name, "brand": "Generic"})
     first = True
     before = len(pattern.stitches)
@@ -245,7 +353,10 @@ for li, (name, hexcol, c, ang, sp, sl, dl, under) in enumerate(layers):
     if pattern.stitches:
         lx, ly = pattern.stitches[-1][:2]; add_tie(pattern, lx, ly)
     pattern.add_command(pe.TRIM)
-    print(f"{name:22s} {len(pattern.stitches) - before:6d} stitches")
+    print(f"{name:40s} {len(pattern.stitches) - before:6d} stitches")
+
+# Last block: trim the twill close to the tack-down line, then the satin border
+block("Black - satin border (trim twill first)", BLACK, [[tack_run], [zz_under], [satin_top]])
 pattern.end()
 
 # centre the design on the origin
