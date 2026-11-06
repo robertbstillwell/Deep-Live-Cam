@@ -8,9 +8,12 @@ import math, sys, numpy as np, cv2
 from PIL import Image
 from scipy import ndimage
 import pyembroidery as pe
+sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
+from satin import skeleton_paths, smooth_path, satin_column
 
 SRC = '/root/.claude/uploads/d354b3f8-a0eb-5581-9f0b-47100bf9b24a/973c3e36-image.jpg'
 OUT = sys.argv[1] if len(sys.argv) > 1 else '.'
+DEBUG = False
 DESIGN_H_MM = 90.0           # finished height of the design
 U = 10                       # working grid: 10 px per mm (1 px == 0.1 mm == 1 embroidery unit)
 
@@ -38,9 +41,9 @@ W = int(round((x1 - x0) * scale)) + 1
 H = int(round((y1 - y0) * scale)) + 1
 
 # classify: 0 black, 1 dark grey, 2 light grey, 3 white
-g = cv2.medianBlur(gray, 13)
-g = cv2.bilateralFilter(g, 11, 45, 11)
-cls = np.digitize(g, [62, 128, 196]).astype(np.uint8)
+g = cv2.medianBlur(gray, 7)
+g = cv2.bilateralFilter(g, 9, 40, 9)
+cls = np.digitize(g, [58, 125, 196]).astype(np.uint8)
 # white vs light grey decided by the local average brightness of the light pixels
 # in a ~2 mm window, so thread sheen specks don't register as white
 light = (cls >= 2).astype(np.float32)
@@ -338,10 +341,69 @@ def block(name, hexcol, runs_list, first_block=False):
 block("Black - placement line (lay twill after)", BLACK, [[tack_run]], first_block=True)
 block("Black - tack-down line", BLACK, [[tack_run]])
 
+SATIN_MAX_W_MM = 3.2      # black strokes narrower than this are sewn as satin columns
+
+def directional_fill(mask, default_angle, sp, sl, big_mm2=300):
+    """Fill each connected component with rows across its long axis."""
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    runs = []
+    for i in range(1, n):
+        comp = lab == i
+        area = stats[i, cv2.CC_STAT_AREA]
+        ang = default_angle
+        if 30 < area < big_mm2 * U * U:
+            ys, xs = np.where(comp)
+            cov = np.cov(np.vstack([xs, ys]))
+            ev, evec = np.linalg.eigh(cov)
+            if ev[1] > 2.0 * ev[0]:                       # clearly elongated
+                major = evec[:, 1]
+                ang = math.degrees(math.atan2(major[1], major[0])) + 90   # rows across the shape
+        runs.extend(fill_layer(comp, ang, sp, sl))
+    return runs
+
+def satin_strokes(thin, dist, density_mm=0.40, pull_mm=0.12):
+    """Satin columns for thin strokes, with a centre-run underlay per column."""
+    runs = []
+    for xy, hw, closed in skeleton_paths(thin, U, dist):
+        xy, hw = smooth_path(xy, hw, 0.5, 9)
+        if closed:
+            xy = np.vstack([xy, xy[:1]]); hw = np.append(hw, hw[0])
+        col = satin_column(xy, hw, density_mm * U, pull_mm * U, 0.35 * U, SATIN_MAX_W_MM / 2 * U)
+        if col is None or len(col) < 4: continue
+        # centre-walk underlay forward, satin back along the stroke
+        seg = np.linalg.norm(np.diff(xy, axis=0), axis=1); L = np.concatenate(([0], np.cumsum(seg)))
+        t = np.arange(0, L[-1], 2.0 * U)
+        run = np.column_stack([np.interp(t, L, xy[:, 0]), np.interp(t, L, xy[:, 1])])
+        run = np.vstack([run, xy[-1:]])
+        runs.append(np.vstack([run, col[::-1]]))
+    return runs
+
+# ---- black split: wide areas -> fill, thin strokes -> satin; lower colours run under the strokes
+m_black0 = (cls_w == 0) & m_w
+m_black = dil(m_black0, 0.22) & m_w
+_r = SATIN_MAX_W_MM / 2
+wide_black = dil(ero(m_black, _r), _r + 0.15) & m_black
+thin_black = m_black0 & ~wide_black
+thin_black = cv2.morphologyEx(thin_black.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)) > 0
+dist_black = ndimage.distance_transform_edt(m_black0)
+_nb = cls_w == 0
+_, (_iy, _ix) = ndimage.distance_transform_edt(_nb, return_indices=True)
+nearest_nonblack = cls_w[_iy, _ix]            # class of the nearest non-black pixel
+Image.fromarray((wide_black * 120 + thin_black * 255).astype(np.uint8)).save(f'{OUT}/debug_black_split.png' if DEBUG else '/dev/null')
+
+def satin_coverage(runs, shape):
+    cov = np.zeros(shape, np.uint8)
+    for r in runs:
+        pts = np.round(r).astype(np.int32)
+        cv2.fillPoly(cov, [pts], 1)             # zigzag polygon covers the column
+    return cov > 0
+
 total = 0
 for li, (name, hexcol, c, ang, sp, sl, dl, under) in enumerate(layers):
     m = cls_w == c
     if dl > 0: m = dil(m, dl) & m_w
+    if c != 0:
+        m = m | (thin_black & (nearest_nonblack == c) & m_w)   # fill continues under satin strokes
     pattern.add_command(pe.COLOR_CHANGE)
     pattern.add_thread({"color": hexcol, "description": name, "brand": "Generic"})
     first = True
@@ -349,7 +411,26 @@ for li, (name, hexcol, c, ang, sp, sl, dl, under) in enumerate(layers):
     if under:      # light lattice underlay to stabilise big fills
         um = ero(m, 0.5)
         first = add_runs(pattern, fill_layer(um, ang + 90, 2.0, 4.0, 1.0), first)
-    first = add_runs(pattern, fill_layer(m, ang, sp, sl), first)
+    if c == 0:
+        # black: wide areas get a fill, thin strokes (outlines, lettering) get satin,
+        # and whatever the satin columns miss gets a small fill so nothing is left bare
+        first = add_runs(pattern, directional_fill(wide_black, ang, sp, sl), first)
+        n_before = len(pattern.stitches)
+        sat = satin_strokes(thin_black, dist_black)
+        first = add_runs(pattern, sat, first)
+        print(f"{'  satin strokes':40s} {len(pattern.stitches) - n_before:6d} stitches")
+        rem = thin_black & ~satin_coverage(sat, m_w.shape)
+        rem = cv2.morphologyEx(rem.astype(np.uint8), cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+        rem = dil(rem, 0.2) & thin_black
+        n_before = len(pattern.stitches)
+        first = add_runs(pattern, directional_fill(rem, ang, sp, 2.0), first)
+        print(f"{'  remainder fill':40s} {len(pattern.stitches) - n_before:6d} stitches")
+        Image.fromarray((rem * 255).astype(np.uint8)).save(f'{OUT}/debug_black_remainder.png' if DEBUG else '/dev/null')
+    elif c == 1:
+        first = add_runs(pattern, directional_fill(m, ang, sp, sl), first)
+    else:
+        first = add_runs(pattern, fill_layer(m, ang, sp, sl), first)
     if pattern.stitches:
         lx, ly = pattern.stitches[-1][:2]; add_tie(pattern, lx, ly)
     pattern.add_command(pe.TRIM)

@@ -12,7 +12,7 @@ Auto-digitized from a photo of the embroidered patch.
 | `crimson_tide_patch_layers.png` | Colour-separated artwork the stitches were built from |
 
 **Design:** 82 x 93 mm (3.25 x 3.65 in) including the satin border, fits a 4x4 in / 100x100 mm hoop.
-**Stitches:** ~17,900, 4 thread colours, 6 machine stops.
+**Stitches:** ~24,400, 4 thread colours, 6 machine stops.
 
 Sewing sequence (each line is a machine stop):
 1. Black – placement line on the stabilizer. STOP: lay the twill over it.
@@ -23,13 +23,19 @@ Sewing sequence (each line is a machine stop):
 6. Black – outlines and "CRIMSON TIDE" lettering. STOP: trim the twill ~1 mm outside the tack-down line.
 7. Black – 3 mm satin border over the raw edge (run tack + zigzag underlay + satin).
 
-Fill style: tatami fill, 0.35–0.38 mm row spacing, 2.4–3 mm stitch length,
-light lattice underlay under the grey and white areas, 0.2 mm pull compensation
-on the upper colours, tie-in/tie-off and trims between islands.
+Stitch types:
+- Lettering and all black outlines narrower than ~3 mm are **satin columns**
+  (0.4 mm density, centre-run underlay, width follows the stroke, 0.12 mm pull
+  compensation). Wider black areas and anything the columns miss get a fill.
+- Grey, white and elephant shading are tatami fills, 0.35–0.38 mm row spacing,
+  2.4–3 mm stitch length, rows run across each shape's long axis, lattice underlay
+  under the big grey and white areas, 0.2 mm pull compensation. The grey and white
+  fills continue underneath the satin strokes so no fabric shows through.
+- Tie-in/tie-off and trims between islands.
 
 Suggested setup: cut-away or heavy tear-away stabilizer hooped alone, patch twill
 laid on after the placement line, 75/11 needle, standard 40 wt polyester.
 After the final stop, peel/cut the stabilizer close to the border.
 
 Regenerate / change size: edit `DESIGN_H_MM` in `digitize_patch.py` and run
-`python3 digitize_patch.py <output dir>` (needs pyembroidery, opencv-python-headless, scipy, pillow).
+`python3 digitize_patch.py <output dir>` (needs pyembroidery, opencv-python-headless, scipy, scikit-image, pillow; keep `satin.py` next to it).
